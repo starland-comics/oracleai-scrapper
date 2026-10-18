@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
-pysofascore
 curl_cffi
+playwright
