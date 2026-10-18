@@ -8,7 +8,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Scraper (FotMob)", version="3.0")
+app = FastAPI(title="Oracle AI Scraper (FotMob Debug)", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,9 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Кэш
 _cache: Dict[str, Any] = {}
-_CACHE_TTL = 60  # секунд
+_CACHE_TTL = 60
 
 def cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
@@ -31,10 +30,12 @@ def cache_get(key: str) -> Optional[Any]:
 def cache_set(key: str, data: Any) -> None:
     _cache[key] = {"data": data, "time": datetime.now()}
 
-# Заголовки для FotMob (он не блокирует сервера так жестко)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.fotmob.com/",
+    "Origin": "https://www.fotmob.com",
 }
 
 async def fetch_fotmob(path: str) -> Dict:
@@ -44,55 +45,45 @@ async def fetch_fotmob(path: str) -> Dict:
         return cached
 
     url = f"https://www.fotmob.com/api{path}"
-    async with httpx.AsyncClient() as client:
+    logger.info(f"Запрос к FotMob: {url}") # Логируем URL
+
+    async with httpx.AsyncClient(http2=True) as client: # Включаем HTTP/2
         try:
-            resp = await client.get(url, headers=HEADERS, timeout=10.0)
+            resp = await client.get(url, headers=HEADERS, timeout=15.0)
+            logger.info(f"Ответ FotMob: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
                 cache_set(cache_key, data)
                 return data
             else:
-                logger.error(f"FotMob HTTP {resp.status_code} for {path}")
-                raise HTTPException(status_code=resp.status_code, detail="FotMob API error")
+                logger.error(f"FotMob HTTP {resp.status_code} for {url}. Ответ: {resp.text[:200]}")
+                raise HTTPException(status_code=resp.status_code, detail=f"FotMob error: {resp.status_code}")
         except Exception as e:
-            logger.error(f"Fetch error: {e}")
+            logger.error(f"Fetch error для {url}: {e}")
             raise HTTPException(status_code=502, detail=str(e))
 
-@app.get("/api/matches/date/{date_str}")
-async def get_matches_by_date(date_str: str):
-    # FotMob ожидает дату в формате YYYYMMDD (без дефисов)
-    clean_date = date_str.replace("-", "")
-    data = await fetch_fotmob(f"/matches?date={clean_date}")
+@app.get("/api/debug/fotmob-test")
+async def debug_fotmob():
+    """Тестовый эндпоинт для проверки доступа к FotMob."""
+    today_str = datetime.now().strftime("%Y%m%d")
+    url = f"https://www.fotmob.com/api/matches?date={today_str}"
     
-    # Извлекаем все лиги и матчи
-    leagues = data.get("leagues", [])
-    result = []
-    
-    for league in leagues:
-        league_name = league.get("name", "")
-        for match in league.get("matches", []):
-            result.append({
-                "id": match.get("id"),
-                "home": match.get("home", {}).get("name", ""),
-                "away": match.get("away", {}).get("name", ""),
-                "homeLogo": f"https://images.fotmob.com/image_resources/logo/teamlogo/{match.get('home', {}).get('id')}.png",
-                "awayLogo": f"https://images.fotmob.com/image_resources/logo/teamlogo/{match.get('away', {}).get('id')}.png",
-                "homeScore": match.get("home", {}).get("score"),
-                "awayScore": match.get("away", {}).get("score"),
-                "status": match.get("status", {}).get("utcTime", "") if match.get("status", {}).get("started") is False else "LIVE",
-                "startTimestamp": match.get("status", {}).get("utcTime"),
-                "league": league_name,
-                "minute": match.get("status", {}).get("liveTime", {}).get("short", "")
-            })
-            
-    return result
+    async with httpx.AsyncClient(http2=True) as client:
+        resp = await client.get(url, headers=HEADERS, timeout=15.0)
+        return {
+            "url": url,
+            "status_code": resp.status_code,
+            "headers": dict(resp.headers),
+            "body_start": resp.text[:500] # Первые 500 символов ответа
+        }
 
 @app.get("/api/matches/live")
 async def get_live_matches():
-    # FotMob не имеет прямого эндпоинта "live", 
-    # поэтому мы берем матчи на сегодня и фильтруем те, что уже начались
     today_str = datetime.now().strftime("%Y%m%d")
-    data = await fetch_fotmob(f"/matches?date={today_str}")
+    try:
+        data = await fetch_fotmob(f"/matches?date={today_str}")
+    except HTTPException as e:
+        raise e
     
     leagues = data.get("leagues", [])
     result = []
@@ -121,15 +112,11 @@ async def get_live_matches():
 async def get_match_detail(event_id: str):
     data = await fetch_fotmob(f"/matchDetails?matchId={event_id}")
     
-    # Извлекаем нужные данные из огромного JSON FotMob
     general = data.get("general", {})
     header = data.get("header", {})
     content = data.get("content", {})
     
-    # Статистика
     stats = content.get("stats", {}).get("Periods", {}).get("All", {}).get("stats", [])
-    # Составы
-    lineups = content.get("lineup", {})
     
     return {
         "event": {
@@ -145,22 +132,12 @@ async def get_match_detail(event_id: str):
             "league": general.get("leagueName")
         },
         "statistics": stats,
-        "lineups": lineups
+        "lineups": content.get("lineup", {})
     }
-
-@app.get("/api/match/{event_id}/odds")
-async def get_match_odds(event_id: str):
-    # FotMob хранит коэффициенты внутри деталей матча (в блоке content.odds)
-    data = await fetch_fotmob(f"/matchDetails?matchId={event_id}")
-    
-    # Пытаемся достать коэффициенты 1X2
-    odds_data = data.get("content", {}).get("odds", {})
-    
-    return odds_data
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "oracle-scraper-fotmob"}
+    return {"status": "ok", "service": "oracle-scraper-fotmob-debug"}
 
 if __name__ == "__main__":
     import uvicorn
