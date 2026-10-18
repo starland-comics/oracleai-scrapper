@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
-# и другие ваши зависимости
+pysofascore
+curl_cffi
