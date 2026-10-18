@@ -10,7 +10,7 @@ import math
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Luxury", version="11.0")
+app = FastAPI(title="Oracle AI Luxury", version="13.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,33 +39,40 @@ async def fetch_fotmob(path: str) -> Dict:
             logger.error(f"FotMob error: {e}")
     return {}
 
-async def get_team_avg_goals(team_id: int):
-    if not team_id: return 1.3, 1.3
+# Функция получения последних 5 игр (форма) и средних голов
+async def get_team_form_and_goals(team_id: int):
+    if not team_id: return "Нет данных", 1.3, 1.3
     data = await fetch_fotmob(f"/teams?id={team_id}")
     try:
         fixtures = data.get("fixtures", {}).get("allFixtures", {}).get("fixtures", [])
         finished = [f for f in fixtures if f.get("status", {}).get("finished")]
         last_5 = finished[-5:]
         
-        if not last_5: return 1.3, 1.3
+        if not last_5: return "Нет данных", 1.3, 1.3
         
+        form_str = []
         goals_scored = 0
         goals_conceded = 0
+        
         for f in last_5:
-            is_team_home = (f.get("home", {}).get("id") == team_id)
-            score_h = f.get("home", {}).get("score", 0)
-            score_a = f.get("away", {}).get("score", 0)
+            is_home = (f.get("home", {}).get("id") == team_id)
+            sh = f.get("home", {}).get("score", 0)
+            sa = f.get("away", {}).get("score", 0)
             
-            if is_team_home:
-                goals_scored += score_h
-                goals_conceded += score_a
+            if is_home:
+                goals_scored += sh; goals_conceded += sa
+                res = "В" if sh > sa else ("П" if sh < sa else "Н")
+                form_str.append(f"{res} {sh}:{sa}")
             else:
-                goals_scored += score_a
-                goals_conceded += score_h
+                goals_scored += sa; goals_conceded += sh
+                res = "В" if sa > sh else ("П" if sa < sh else "Н")
+                form_str.append(f"{res} {sa}:{sh}")
                 
-        return goals_scored / len(last_5), goals_conceded / len(last_5)
+        avg_s = goals_scored / len(last_5)
+        avg_c = goals_conceded / len(last_5)
+        return ", ".join(form_str), avg_s, avg_c
     except:
-        return 1.3, 1.3
+        return "Нет данных", 1.3, 1.3
 
 @app.get("/api/matches/live")
 async def get_live_matches():
@@ -159,44 +166,48 @@ async def run_oracle(event_id: str):
     fx = match_data["event"]
     
     xg_h, xg_a = 0.0, 0.0
-    shots_h, shots_a, sot_h, sot_a = 0, 0, 0, 0
+    shots_h, shots_a, sot_h, sot_a, poss_h, poss_a = 0, 0, 0, 0, 50, 50
     has_real_xg = False
 
+    # 1. Парсинг статистики (ищем по title)
     for s in match_data["statistics"]:
-        name = s.get("name", "").lower()
+        title = s.get("title", "").lower() 
         stats = s.get("stats", [0, 0])
         if not isinstance(stats, list) or len(stats) < 2: continue
         
         try:
-            if "xg" in name or "expected goals" in name:
+            if "xg" in title or "expected goals" in title:
                 if stats[0] != "-" and stats[1] != "-": 
-                    xg_h = float(stats[0])
-                    xg_a = float(stats[1])
-                    has_real_xg = True
-            if "total shots" in name:
+                    xg_h = float(stats[0]); xg_a = float(stats[1]); has_real_xg = True
+            if "total shots" in title:
                 if stats[0] != "-": shots_h = int(stats[0])
                 if stats[1] != "-": shots_a = int(stats[1])
-            if "shots on target" in name:
+            if "shots on target" in title:
                 if stats[0] != "-": sot_h = int(stats[0])
                 if stats[1] != "-": sot_a = int(stats[1])
+            if "possession" in title:
+                if stats[0] != "-": poss_h = int(stats[0].replace('%',''))
+                if stats[1] != "-": poss_a = int(stats[1].replace('%',''))
         except: pass
 
-    xg_note = "На основе реальной статистики xG." if has_real_xg else "Внимание: Реальный xG отсутствует в статистике. Расчет xG основан на ударах и истории команд."
+    # 2. Получение формы команд
+    home_form_str, h_avg, h_conc = await get_team_form_and_goals(fx.get("homeId"))
+    away_form_str, a_avg, a_conc = await get_team_form_and_goals(fx.get("awayId"))
 
+    xg_note = "На основе реальной статистики xG." if has_real_xg else "Внимание: Реальный xG отсутствует в статистике."
+    
     if not has_real_xg:
         if shots_h > 0 or shots_a > 0:
             xg_h = (sot_h * 0.3) + ((shots_h - sot_h) * 0.05)
             xg_a = (sot_a * 0.3) + ((shots_a - sot_a) * 0.05)
         else:
-            h_avg, h_conc = await get_team_avg_goals(fx.get("homeId"))
-            a_avg, a_conc = await get_team_avg_goals(fx.get("awayId"))
             xg_h = (h_avg + a_conc) / 2
             xg_a = (a_avg + h_conc) / 2
 
     if xg_h <= 0: xg_h = 1.2
     if xg_a <= 0: xg_a = 1.2
 
-    # Математика
+    # 3. Математика
     gh, ga = fx["homeScore"], fx["awayScore"]
     time_left = 1.0 if fx["status"] == "NS" else 0.0
     minute = 0
@@ -219,8 +230,7 @@ async def run_oracle(event_id: str):
 
     handicap_lines = [-4.5, -4, -3.5, -3, -2.5, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5]
     for h_val in handicap_lines:
-        markets[f"AH1_{h_val}"] = 0
-        markets[f"AH2_{h_val}"] = 0
+        markets[f"AH1_{h_val}"] = 0; markets[f"AH2_{h_val}"] = 0
 
     is_ht_active = fx["status"] == "NS" or (fx["status"] == "LIVE" and minute <= 45)
     if is_ht_active:
@@ -237,7 +247,6 @@ async def run_oracle(event_id: str):
             if fh > fa: markets["1"] += p
             elif fh < fa: markets["2"] += p
             else: markets["X"] += p
-
             if fh > 0 and fa > 0: markets["BTTS_Yes"] += p
             else: markets["BTTS_No"] += p
 
@@ -254,30 +263,13 @@ async def run_oracle(event_id: str):
                 if fh + h_val > fa: markets[f"AH1_{h_val}"] += p
                 if fa + h_val > fh: markets[f"AH2_{h_val}"] += p
 
-    if is_ht_active:
-        ht_time_left = 1.0 if fx["status"] == "NS" else max(0, (45 - minute) / 90)
-        lambda_h_ht = xg_h * ht_time_left
-        lambda_a_ht = xg_a * ht_time_left
-        for h in range(8):
-            for a in range(8):
-                p_h = (math.exp(-lambda_h_ht) * (lambda_h_ht**h)) / math.factorial(h)
-                p_a = (math.exp(-lambda_a_ht) * (lambda_a_ht**a)) / math.factorial(a)
-                p = p_h * p_a
-                fh, fa = gh + h, ga + a
-                tg = fh + fa
-                for t in [0.5, 1.5, 2.5, 3.5, 4.5]:
-                    if tg > t: markets[f"HT_O{t}"] += p
-                    else: markets[f"HT_U{t}"] += p
-
     total_p = markets["1"] + markets["X"] + markets["2"]
     for k in markets: markets[k] /= total_p
 
-    # ФИЛЬТРАЦИЯ ДЛЯ ПОИСКА ВАЛУЯ (Ищем вероятности 50-88%)
+    # 4. Фильтрация (55% - 85%)
     available = []
-    
     def add_market(name, prob):
-        # Исключаем "мертвые" ставки (вероятность >88% или <50%)
-        if 0.50 <= prob <= 0.88:
+        if 0.55 <= prob <= 0.85:
             available.append({"name": name, "prob": prob})
 
     if fx["status"] != "FT":
@@ -286,52 +278,61 @@ async def run_oracle(event_id: str):
         add_market(f"П2 ({fx['away']})", markets["2"])
 
     for t in total_lines:
-        add_market(f"ТБ {t}", markets[f"O{t}"])
-        add_market(f"ТМ {t}", markets[f"U{t}"])
-        add_market(f"ИТ1 Б {t}", markets[f"IT1_O{t}"])
-        add_market(f"ИТ1 М {t}", markets[f"IT1_U{t}"])
-        add_market(f"ИТ2 Б {t}", markets[f"IT2_O{t}"])
-        add_market(f"ИТ2 М {t}", markets[f"IT2_U{t}"])
+        add_market(f"ТБ {t}", markets[f"O{t}"]); add_market(f"ТМ {t}", markets[f"U{t}"])
+        add_market(f"ИТ1 Б {t}", markets[f"IT1_O{t}"]); add_market(f"ИТ1 М {t}", markets[f"IT1_U{t}"])
+        add_market(f"ИТ2 Б {t}", markets[f"IT2_O{t}"]); add_market(f"ИТ2 М {t}", markets[f"IT2_U{t}"])
 
     for h_val in handicap_lines:
         add_market(f"Ф1 ({h_val})", markets[f"AH1_{h_val}"])
         add_market(f"Ф2 ({h_val})", markets[f"AH2_{h_val}"])
 
-    add_market("ОЗ (Да)", markets["BTTS_Yes"])
-    add_market("ОЗ (Нет)", markets["BTTS_No"])
+    add_market("ОЗ (Да)", markets["BTTS_Yes"]); add_market("ОЗ (Нет)", markets["BTTS_No"])
 
     if is_ht_active:
         for t in [0.5, 1.5, 2.5, 3.5, 4.5]:
             add_market(f"ТБ {t} в 1-м тайме", markets[f"HT_O{t}"])
             add_market(f"ТМ {t} в 1-м тайме", markets[f"HT_U{t}"])
 
-    # Если из-за фильтра ничего не осталось (матч почти закончился), ослабляем фильтр
     if not available:
         for k, v in markets.items():
-            if 0.3 <= v <= 0.97:
-                available.append({"name": k, "prob": v})
+            if 0.3 <= v <= 0.97: available.append({"name": k, "prob": v})
 
     available.sort(key=lambda x: x["prob"], reverse=True)
     top_markets = available[:6]
     top_markets_str = "\n".join([f"- {m['name']} ({(m['prob']*100):.1f}%)" for m in top_markets])
 
+    # 5. ПРОМПТ (Заставляем ИИ использовать все данные)
     prompt = f"""
-    Ты профессиональный футбольный каппер (синдикатор).
-    Матч: {fx['home']} против {fx['away']}. Счет: {gh}:{ga} ({fx['status']}).
-    xG команд: {xg_h:.2f} vs {xg_a:.2f} ({xg_note})
-    
-    Доступные рынки (вероятность 50-88%, оптимальные для кэфов):
-    {top_markets_str}
-    
-    Травмы: {json.dumps(match_data['missing'])}. H2H: {json.dumps(match_data['h2h'])}.
+    Ты профессиональный футбольный каппер (синдикатор). Твоя задача — дать всесторонний анализ и найти ставку с лучшим соотношением риска и прибыли (Value).
 
-    ТВОЯ ЦЕЛЬ: Найти ставку с наилучшим соотношением риска и потенциальной прибыли (Value). 
-    НЕ БЕРИ ставки с вероятностью >88% (например, ТМ 6.5), так как коэффициент на них будет 1.01.
-    Выбери ЛУЧШИЙ исход из списка. Напиши профессиональный разбор. Верни текст СТРОГО в таком формате:
-    [PICK] Твой главный прогноз (точное название из списка)
-    [ANALYSIS] Подробный анализ на 3 абзаца. Почему этот исход? Упомяни xG, математику и контекст.
-    [RISK] Главный риск этой ставки.
-    [ALT] Альтернативный исход из списка.
+    КОНТЕКСТ МАТЧА:
+    - {fx['home']} против {fx['away']} (Лига: {fx['league']})
+    - Счет: {gh}:{ga}. Статус: {fx['status']} ({fx['minute']}).
+    - Владение мячом: {poss_h}% на {poss_a}%. Удары: {shots_h} на {shots_a} (в створ: {sot_h} на {sot_a}).
+    - xG команд: {xg_h:.2f} против {xg_a:.2f} ({xg_note})
+
+    ДОПОЛНИТЕЛЬНЫЕ ФАКТОРЫ (Обязательно учти!):
+    - Последние 5 игр Хозяев: {home_form_str} (в среднем забивают {h_avg:.1f}, пропускают {h_conc:.1f})
+    - Последние 5 игр Гостей: {away_form_str} (в среднем забивают {a_avg:.1f}, пропускают {a_conc:.1f})
+    - Травмы/Дисквалификации: Хозяева - {', '.join(match_data['missing']['home']) or 'нет'}. Гости - {', '.join(match_data['missing']['away']) or 'нет'}.
+    - Личные встречи (H2H): {json.dumps(match_data['h2h'])}.
+
+    ДОСТУПНЫЕ РЫНКИ (вероятность 55-85%, лучшие для кэфов):
+    {top_markets_str}
+
+    ТВОЯ ЗАДАЧА:
+    Выбери ЛУЧШИЙ исход из списка (не бери кэфы 1.01). 
+    Напиши разбор СТРОГО из 4 абзацев:
+    1. Контекст и давление (кто владеет инициативой, как идет игра).
+    2. Статистика и xG (сравни удары, ожидаемые голы).
+    3. Форма, травмы и H2H (как это влияет на игру).
+    4. Вывод (почему выбранный исход имеет ценность).
+
+    Формат ответа СТРОГО:
+    [PICK] Название исхода
+    [ANALYSIS] (Текст из 4 абзацев)
+    [RISK] Главный риск.
+    [ALT] Альтернативный исход.
     """
 
     try:
@@ -343,9 +344,9 @@ async def run_oracle(event_id: str):
                     "model": "openai/gpt-oss-120b",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 1000
+                    "max_tokens": 1500
                 },
-                timeout=20.0
+                timeout=25.0
             )
         
         if ai_res.status_code != 200:
