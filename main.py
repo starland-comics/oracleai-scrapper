@@ -8,7 +8,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Scraper (FotMob)", version="3.2")
+app = FastAPI(title="Oracle AI Scraper (FotMob)", version="3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,11 +44,11 @@ async def fetch_fotmob(path: str) -> Dict:
     if cached:
         return cached
 
-    url = f"https://www.fotmob.com/api{path}"
+    # ИСПРАВЛЕНО: добавлен префикс /data/
+    url = f"https://www.fotmob.com/api/data{path}"
     logger.info(f"Запрос к FotMob: {url}")
 
-    # Убрали http2=True, чтобы избежать ошибок зависимостей
-    async with httpx.AsyncClient() as client: 
+    async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(url, headers=HEADERS, timeout=15.0)
             if resp.status_code == 200:
@@ -64,9 +64,9 @@ async def fetch_fotmob(path: str) -> Dict:
 
 @app.get("/api/debug/fotmob-test")
 async def debug_fotmob():
-    """Тестовый эндпоинт, который покажет ошибку, если она есть."""
+    """Тестовый эндпоинт с исправленным путём."""
     today_str = datetime.now().strftime("%Y%m%d")
-    url = f"https://www.fotmob.com/api/matches?date={today_str}"
+    url = f"https://www.fotmob.com/api/data/matches?date={today_str}&timezone=UTC"
     
     try:
         async with httpx.AsyncClient() as client:
@@ -75,7 +75,7 @@ async def debug_fotmob():
                 "status": "success",
                 "url": url,
                 "status_code": resp.status_code,
-                "body_start": resp.text[:300] # Показываем кусок ответа
+                "body_start": resp.text[:300]
             }
     except Exception as e:
         return {
@@ -85,10 +85,37 @@ async def debug_fotmob():
             "message": str(e)
         }
 
+@app.get("/api/matches/date/{date_str}")
+async def get_matches_by_date(date_str: str):
+    clean_date = date_str.replace("-", "")
+    # ИСПРАВЛЕНО: /data/matches с параметром timezone
+    data = await fetch_fotmob(f"/matches?date={clean_date}&timezone=UTC")
+    
+    leagues = data.get("leagues", [])
+    result = []
+    
+    for league in leagues:
+        league_name = league.get("name", "")
+        for match in league.get("matches", []):
+            result.append({
+                "id": match.get("id"),
+                "home": match.get("home", {}).get("name", ""),
+                "away": match.get("away", {}).get("name", ""),
+                "homeLogo": f"https://images.fotmob.com/image_resources/logo/teamlogo/{match.get('home', {}).get('id')}.png",
+                "awayLogo": f"https://images.fotmob.com/image_resources/logo/teamlogo/{match.get('away', {}).get('id')}.png",
+                "homeScore": match.get("home", {}).get("score"),
+                "awayScore": match.get("away", {}).get("score"),
+                "status": "LIVE" if match.get("status", {}).get("started") and not match.get("status", {}).get("finished") else ("FT" if match.get("status", {}).get("finished") else "NS"),
+                "startTimestamp": match.get("status", {}).get("utcTime"),
+                "league": league_name,
+                "minute": match.get("status", {}).get("liveTime", {}).get("short", "")
+            })
+    return result
+
 @app.get("/api/matches/live")
 async def get_live_matches():
     today_str = datetime.now().strftime("%Y%m%d")
-    data = await fetch_fotmob(f"/matches?date={today_str}")
+    data = await fetch_fotmob(f"/matches?date={today_str}&timezone=UTC")
     
     leagues = data.get("leagues", [])
     result = []
@@ -115,6 +142,7 @@ async def get_live_matches():
 
 @app.get("/api/match/{event_id}")
 async def get_match_detail(event_id: str):
+    # ИСПРАВЛЕНО: /data/matchDetails с параметром matchId
     data = await fetch_fotmob(f"/matchDetails?matchId={event_id}")
     
     general = data.get("general", {})
@@ -142,7 +170,7 @@ async def get_match_detail(event_id: str):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "oracle-scraper-fotmob-v3.2"}
+    return {"status": "ok", "service": "oracle-scraper-fotmob-v3.3"}
 
 if __name__ == "__main__":
     import uvicorn
