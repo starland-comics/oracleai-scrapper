@@ -10,7 +10,7 @@ import math
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Luxury", version="6.2")
+app = FastAPI(title="Oracle AI Luxury", version="7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -129,15 +129,55 @@ async def run_oracle(event_id: str):
     match_data = await get_match_detail(event_id)
     fx = match_data["event"]
     
-    # Математика
-    xg_h, xg_a = 1.35, 1.15
+    # 1. УМНЫЙ РАСЧЕТ xG
+    xg_h, xg_a = 0.0, 0.0
+    shots_h, shots_a = 0, 0
+    sot_h, sot_a = 0, 0
+
     for s in match_data["statistics"]:
-        if s.get("name") == "Expected goals (xG)":
+        name = s.get("name", "")
+        if name == "Expected goals (xG)":
             try:
-                xg_h = float(s["stats"][0]) if s["stats"][0] != "-" else xg_h
-                xg_a = float(s["stats"][1]) if s["stats"][1] != "-" else xg_a
+                xg_h = float(s["stats"][0]) if s["stats"][0] != "-" else 0.0
+                xg_a = float(s["stats"][1]) if s["stats"][1] != "-" else 0.0
+            except: pass
+        if name == "Total shots":
+            try:
+                shots_h = int(s["stats"][0]) if s["stats"][0] != "-" else 0
+                shots_a = int(s["stats"][1]) if s["stats"][1] != "-" else 0
+            except: pass
+        if name == "Shots on target":
+            try:
+                sot_h = int(s["stats"][0]) if s["stats"][0] != "-" else 0
+                sot_a = int(s["stats"][1]) if s["stats"][1] != "-" else 0
             except: pass
 
+    # Если xG нет, но есть удары (матч идет) — считаем сами!
+    if xg_h == 0 and xg_a == 0 and (shots_h > 0 or shots_a > 0):
+        xg_h = (sot_h * 0.25) + ((shots_h - sot_h) * 0.05)
+        xg_a = (sot_a * 0.25) + ((shots_a - sot_a) * 0.05)
+
+    # Если это будущий матч (NS), идем в BSD за прогнозами
+    if fx["status"] == "NS" and xg_h == 0:
+        try:
+            async with httpx.AsyncClient() as client:
+                search_q = f"{fx['home']} {fx['away']}"
+                res = await client.get(f"https://sports.bzzoiro.com/api/v2/events/?search={search_q}", headers={"Authorization": f"Token {BSD_TOKEN}"}, timeout=10)
+                if res.status_code == 200 and res.json().get("results"):
+                    bsd_id = res.json()["results"][0]["id"]
+                    pred_res = await client.get(f"https://sports.bzzoiro.com/api/v2/events/{bsd_id}/prediction/", headers={"Authorization": f"Token {BSD_TOKEN}"})
+                    if pred_res.status_code == 200:
+                        pred = pred_res.json()
+                        xg_h = float(pred.get("expected_goals", {}).get("home", 0.0))
+                        xg_a = float(pred.get("expected_goals", {}).get("away", 0.0))
+        except Exception as e:
+            logger.warning(f"BSD xG error: {e}")
+
+    # Если данных вообще нет, ставим средние
+    if xg_h == 0 and xg_a == 0:
+        xg_h, xg_a = 1.35, 1.15
+
+    # 2. Математика
     gh, ga = fx["homeScore"], fx["awayScore"]
     time_left = 1.0 if fx["status"] == "NS" else 0.0
     if fx["status"] == "LIVE":
@@ -167,29 +207,25 @@ async def run_oracle(event_id: str):
     total_p = probs["p1"] + probs["px"] + probs["p2"]
     for k in probs: probs[k] /= total_p
 
+    # 3. Промпт
     prompt = f"""
-    Ты профессиональный футбольный аналитик. Сделай элитный разбор матча.
-    Матч: {fx['home']} против {fx['away']}.
-    Счет: {gh}:{ga}. Статус: {fx['status']} ({fx['minute']}).
-    xG: {xg_h} vs {xg_a}.
-    Травмы: {json.dumps(match_data['missing'])}.
-    H2H: {json.dumps(match_data['h2h'])}.
-    Вероятности модели: П1:{probs['p1']*100:.1f}%, X:{probs['px']*100:.1f}%, П2:{probs['p2']*100:.1f}%, ТБ2.5:{probs['over25']*100:.1f}%, ОЗ:{probs['btts']*100:.1f}%.
+    Ты профессиональный футбольный аналитик.
+    Матч: {fx['home']} против {fx['away']}. Счет: {gh}:{ga} ({fx['status']}). 
+    Рассчитанные ожидаемые голы (xG): {xg_h:.2f} vs {xg_a:.2f}.
+    Вероятности: П1:{probs['p1']*100:.0f}%, X:{probs['px']*100:.0f}%, П2:{probs['p2']*100:.0f}%. ТБ2.5:{probs['over25']*100:.0f}%.
+    Травмы: {json.dumps(match_data['missing'])}. H2H: {json.dumps(match_data['h2h'])}.
 
-    Верни СТРОГО JSON:
-    {{
-        "main_pick": "Лучший исход",
-        "confidence": "Высокая/Средняя/Низкая",
-        "analysis_text": "Подробный анализ на 4 абзаца.",
-        "risk_text": "Главный риск (1 предложение)",
-        "alt_text": "Альтернатива (1-2 предложения)"
-    }}
+    Напиши разбор. Верни текст СТРОГО в таком формате (без лишних символов):
+    [PICK] Твой главный прогноз (например, П1 или ТБ 2.5)
+    [ANALYSIS] Подробный анализ на 3 абзаца. Почему этот исход? Упомяни xG.
+    [RISK] Главный риск этой ставки.
+    [ALT] Альтернативный исход.
     """
 
     fallback_data = {
         "main_pick": f"П1 ({fx['home']})" if probs['p1'] > probs['p2'] else f"П2 ({fx['away']})",
         "confidence": "Средняя",
-        "analysis_text": f"Нейросеть временно недоступна. Математическая модель на основе xG ({xg_h} vs {xg_a}) и оставшегося времени показывает вероятности: П1 - {(probs['p1']*100):.0f}%, X - {(probs['px']*100):.0f}%, П2 - {(probs['p2']*100):.0f}%.",
+        "analysis_text": f"Нейросеть недоступна. Математика: П1 - {(probs['p1']*100):.0f}%, X - {(probs['px']*100):.0f}%, П2 - {(probs['p2']*100):.0f}%. Ожидаемые голы: {xg_h:.2f} - {xg_a:.2f}.",
         "risk_text": "Возможны ошибки из-за отсутствия глубокого ИИ-анализа.",
         "alt_text": "Рекомендуется дождаться восстановления ИИ."
     }
@@ -200,33 +236,39 @@ async def run_oracle(event_id: str):
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                 json={
-                    "model": "llama3-8b-8192",
+                    "model": "llama-3.3-70b-versatile",
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.6,
-                    "response_format": {"type": "json_object"}
+                    "temperature": 0.7,
+                    "max_tokens": 1000
                 },
                 timeout=20.0
             )
         
-        ai_text = ai_res.json().get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        if ai_res.status_code != 200:
+            err_msg = ai_res.text
+            logger.error(f"Groq API Error: {err_msg}")
+            # ВЫВОДИМ ОШИБКУ НА ЭКРАН ДЛЯ ОТЛАДКИ
+            fallback_data["analysis_text"] = f"ОШИБКА GROQ API: {err_msg[:120]}..."
+            return fallback_data
+
+        ai_text = ai_res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         
-        # Очистка от маркдауна
-        if "```json" in ai_text:
-            ai_text = ai_text.split("```json")[1].split("```")[0]
-        elif "```" in ai_text:
-            ai_text = ai_text.split("```")[1].split("```")[0]
-            
-        parsed = json.loads(ai_text.strip())
+        # Защита от кривого парсинга
+        pick = ai_text.split("[PICK]")[1].split("[ANALYSIS]")[0].strip() if "[PICK]" in ai_text else fallback_data["main_pick"]
+        analysis = ai_text.split("[ANALYSIS]")[1].split("[RISK]")[0].strip() if "[ANALYSIS]" in ai_text else ai_text
+        risk = ai_text.split("[RISK]")[1].split("[ALT]")[0].strip() if "[RISK]" in ai_text else "-"
+        alt = ai_text.split("[ALT]")[1].strip() if "[ALT]" in ai_text else "-"
         
         return {
-            "main_pick": parsed.get("main_pick") or fallback_data["main_pick"],
-            "confidence": parsed.get("confidence") or fallback_data["confidence"],
-            "analysis_text": parsed.get("analysis_text") or fallback_data["analysis_text"],
-            "risk_text": parsed.get("risk_text") or fallback_data["risk_text"],
-            "alt_text": parsed.get("alt_text") or fallback_data["alt_text"]
+            "main_pick": pick,
+            "confidence": "Высокая",
+            "analysis_text": analysis,
+            "risk_text": risk,
+            "alt_text": alt
         }
     except Exception as e:
         logger.error(f"Oracle AI error: {e}")
+        fallback_data["analysis_text"] = f"ОШИБКА ПИТОНА: {str(e)[:120]}..."
         return fallback_data
 
 @app.get("/")
