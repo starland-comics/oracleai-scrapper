@@ -5,12 +5,12 @@ from typing import Any, Dict, Optional
 import logging
 import httpx
 import json
-import math  # Используем встроенный math вместо numpy
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Luxury", version="6.1")
+app = FastAPI(title="Oracle AI Luxury", version="6.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,21 +20,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ВАШИ КЛЮЧИ
 GROQ_API_KEY = "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"
 BSD_TOKEN = "c381d2ea1e1569e460c19f762aa5cd8438da4c86"
-
-_cache: Dict[str, Any] = {}
-_CACHE_TTL = 300 
-
-def cache_get(key: str) -> Optional[Any]:
-    entry = _cache.get(key)
-    if entry and (datetime.now() - entry["time"]).total_seconds() < _CACHE_TTL:
-        return entry["data"]
-    return None
-
-def cache_set(key: str, data: Any) -> None:
-    _cache[key] = {"data": data, "time": datetime.now()}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -43,18 +30,12 @@ HEADERS = {
 }
 
 async def fetch_fotmob(path: str) -> Dict:
-    cache_key = f"fotmob:{path}"
-    cached = cache_get(cache_key)
-    if cached: return cached
-
     url = f"https://www.fotmob.com/api/data{path}"
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(url, headers=HEADERS, timeout=10.0)
+            resp = await client.get(url, headers=HEADERS, timeout=15.0)
             if resp.status_code == 200:
-                data = resp.json()
-                cache_set(cache_key, data)
-                return data
+                return resp.json()
         except Exception as e:
             logger.error(f"FotMob error: {e}")
     return {}
@@ -72,11 +53,11 @@ async def get_matches_by_date(date_str: str):
     return parse_matches(data, "ALL")
 
 def parse_matches(data, filter_type):
-    leagues = data.get("leagues", [])
+    leagues = data.get("leagues") or []
     result = []
     for league in leagues:
-        for match in league.get("matches", []):
-            status = match.get("status", {})
+        for match in league.get("matches") or []:
+            status = match.get("status") or {}
             is_live = status.get("started") and not status.get("finished")
             is_ft = status.get("finished")
             
@@ -101,29 +82,29 @@ def parse_matches(data, filter_type):
 async def get_match_detail(event_id: str):
     data = await fetch_fotmob(f"/matchDetails?matchId={event_id}")
     if not data:
-        # Если FotMob не ответил, отдаем заглушку, чтобы фронтенд не падал
         return {"event": {"id": event_id, "home": "Хозяева", "away": "Гости", "status": "NS", "homeScore": 0, "awayScore": 0, "minute": "", "league": "Матч"}, "statistics": [], "h2h": [], "missing": {"home": [], "away": []}}
 
-    general = data.get("general", {})
-    header = data.get("header", {})
-    content = data.get("content", {})
+    general = data.get("general") or {}
+    header = data.get("header") or {}
+    content = data.get("content") or {}
     
-    stats = content.get("stats", {}).get("Periods", {}).get("All", {}).get("stats", [])
+    stats = (content.get("stats") or {}).get("Periods", {}).get("All", {}).get("stats") or []
     
     h2h = []
     try:
-        for m in content.get("h2h", {}).get("matches", [])[-5:]:
+        for m in (content.get("h2h") or {}).get("matches", [])[-5:]:
             h2h.append(f"{m.get('time', {}).get('utcTime', '')[:10]}: {m.get('home', {}).get('name')} {m.get('home', {}).get('score')}:{m.get('away', {}).get('score')} {m.get('away', {}).get('name')}")
     except: pass
 
     missing = {"home": [], "away": []}
     try:
-        lineup = content.get("lineup", {})
-        missing["home"] = [p.get("name") for p in lineup.get("homeTeam", {}).get("missingPlayers", [])]
-        missing["away"] = [p.get("name") for p in lineup.get("awayTeam", {}).get("missingPlayers", [])]
+        lineup = content.get("lineup") or {}
+        missing["home"] = [p.get("name") for p in (lineup.get("homeTeam") or {}).get("missingPlayers") or []]
+        missing["away"] = [p.get("name") for p in (lineup.get("awayTeam") or {}).get("missingPlayers") or []]
     except: pass
 
-    teams = header.get("teams", [{}, {}])
+    teams = header.get("teams") or [{}, {}]
+    if len(teams) < 2: teams = [{}, {}]
     
     return {
         "event": {
@@ -148,7 +129,7 @@ async def run_oracle(event_id: str):
     match_data = await get_match_detail(event_id)
     fx = match_data["event"]
     
-    # 1. Математика (ИСПРАВЛЕНО: используем math.factorial)
+    # Математика
     xg_h, xg_a = 1.35, 1.15
     for s in match_data["statistics"]:
         if s.get("name") == "Expected goals (xG)":
@@ -170,8 +151,6 @@ async def run_oracle(event_id: str):
     if ga > gh: lambda_h *= 1.2
 
     probs = {"p1": 0, "px": 0, "p2": 0, "over25": 0, "btts": 0}
-    
-    # Используем встроенный math
     for h in range(6):
         for a in range(6):
             p_h = (math.exp(-lambda_h) * (lambda_h**h)) / math.factorial(h)
@@ -188,7 +167,6 @@ async def run_oracle(event_id: str):
     total_p = probs["p1"] + probs["px"] + probs["p2"]
     for k in probs: probs[k] /= total_p
 
-    # 2. Промпт
     prompt = f"""
     Ты профессиональный футбольный аналитик. Сделай элитный разбор матча.
     Матч: {fx['home']} против {fx['away']}.
@@ -208,6 +186,14 @@ async def run_oracle(event_id: str):
     }}
     """
 
+    fallback_data = {
+        "main_pick": f"П1 ({fx['home']})" if probs['p1'] > probs['p2'] else f"П2 ({fx['away']})",
+        "confidence": "Средняя",
+        "analysis_text": f"Нейросеть временно недоступна. Математическая модель на основе xG ({xg_h} vs {xg_a}) и оставшегося времени показывает вероятности: П1 - {(probs['p1']*100):.0f}%, X - {(probs['px']*100):.0f}%, П2 - {(probs['p2']*100):.0f}%.",
+        "risk_text": "Возможны ошибки из-за отсутствия глубокого ИИ-анализа.",
+        "alt_text": "Рекомендуется дождаться восстановления ИИ."
+    }
+
     try:
         async with httpx.AsyncClient() as client:
             ai_res = await client.post(
@@ -219,24 +205,29 @@ async def run_oracle(event_id: str):
                     "temperature": 0.6,
                     "response_format": {"type": "json_object"}
                 },
-                timeout=15.0
+                timeout=20.0
             )
         
-        ai_data = ai_res.json().get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        ai_text = ai_res.json().get("choices", [{}])[0].get("message", {}).get("content", "{}")
         
-        # Очистка от маркдауна, если ИИ его добавил
-        ai_data = ai_data.replace("```json", "").replace("```", "").strip()
-        return json.loads(ai_data)
+        # Очистка от маркдауна
+        if "```json" in ai_text:
+            ai_text = ai_text.split("```json")[1].split("```")[0]
+        elif "```" in ai_text:
+            ai_text = ai_text.split("```")[1].split("```")[0]
+            
+        parsed = json.loads(ai_text.strip())
+        
+        return {
+            "main_pick": parsed.get("main_pick") or fallback_data["main_pick"],
+            "confidence": parsed.get("confidence") or fallback_data["confidence"],
+            "analysis_text": parsed.get("analysis_text") or fallback_data["analysis_text"],
+            "risk_text": parsed.get("risk_text") or fallback_data["risk_text"],
+            "alt_text": parsed.get("alt_text") or fallback_data["alt_text"]
+        }
     except Exception as e:
         logger.error(f"Oracle AI error: {e}")
-        # Если ИИ упал, отдаем фолбэк, чтобы фронтенд не показывал "Сервер занят"
-        return {
-            "main_pick": "Ошибка ИИ",
-            "confidence": "Низкая",
-            "analysis_text": "Не удалось получить ответ от нейросети. Попробуйте позже.",
-            "risk_text": "-",
-            "alt_text": "-"
-        }
+        return fallback_data
 
 @app.get("/")
 async def health():
