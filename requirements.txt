@@ -1,0 +1,3 @@
+fastapi
+uvicorn[standard]
+# и другие ваши зависимости
