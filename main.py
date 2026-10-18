@@ -10,7 +10,7 @@ import math
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Luxury", version="7.1")
+app = FastAPI(title="Oracle AI Luxury", version="10.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,7 +21,6 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = "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"
-BSD_TOKEN = "c381d2ea1e1569e460c19f762aa5cd8438da4c86"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -33,12 +32,40 @@ async def fetch_fotmob(path: str) -> Dict:
     url = f"https://www.fotmob.com/api/data{path}"
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(url, headers=HEADERS, timeout=15.0)
+            resp = await client.get(url, headers=HEADERS, timeout=10.0)
             if resp.status_code == 200:
                 return resp.json()
         except Exception as e:
             logger.error(f"FotMob error: {e}")
     return {}
+
+async def get_team_avg_goals(team_id: int):
+    if not team_id: return 1.3, 1.3
+    data = await fetch_fotmob(f"/teams?id={team_id}")
+    try:
+        fixtures = data.get("fixtures", {}).get("allFixtures", {}).get("fixtures", [])
+        finished = [f for f in fixtures if f.get("status", {}).get("finished")]
+        last_5 = finished[-5:]
+        
+        if not last_5: return 1.3, 1.3
+        
+        goals_scored = 0
+        goals_conceded = 0
+        for f in last_5:
+            is_team_home = (f.get("home", {}).get("id") == team_id)
+            score_h = f.get("home", {}).get("score", 0)
+            score_a = f.get("away", {}).get("score", 0)
+            
+            if is_team_home:
+                goals_scored += score_h
+                goals_conceded += score_a
+            else:
+                goals_scored += score_a
+                goals_conceded += score_h
+                
+        return goals_scored / len(last_5), goals_conceded / len(last_5)
+    except:
+        return 1.3, 1.3
 
 @app.get("/api/matches/live")
 async def get_live_matches():
@@ -109,6 +136,8 @@ async def get_match_detail(event_id: str):
     return {
         "event": {
             "id": general.get("matchId", event_id),
+            "homeId": teams[0].get("id"),
+            "awayId": teams[1].get("id"),
             "home": teams[0].get("name", "Хозяева"),
             "away": teams[1].get("name", "Гости"),
             "homeLogo": f"https://images.fotmob.com/image_resources/logo/teamlogo/{teams[0].get('id')}.png" if teams[0].get('id') else "",
@@ -131,55 +160,42 @@ async def run_oracle(event_id: str):
     
     # 1. УМНЫЙ РАСЧЕТ xG
     xg_h, xg_a = 0.0, 0.0
-    shots_h, shots_a = 0, 0
-    sot_h, sot_a = 0, 0
+    shots_h, shots_a, sot_h, sot_a = 0, 0, 0, 0
 
     for s in match_data["statistics"]:
         name = s.get("name", "")
-        if name == "Expected goals (xG)":
-            try:
-                xg_h = float(s["stats"][0]) if s["stats"][0] != "-" else 0.0
-                xg_a = float(s["stats"][1]) if s["stats"][1] != "-" else 0.0
-            except: pass
-        if name == "Total shots":
-            try:
-                shots_h = int(s["stats"][0]) if s["stats"][0] != "-" else 0
-                shots_a = int(s["stats"][1]) if s["stats"][1] != "-" else 0
-            except: pass
-        if name == "Shots on target":
-            try:
-                sot_h = int(s["stats"][0]) if s["stats"][0] != "-" else 0
-                sot_a = int(s["stats"][1]) if s["stats"][1] != "-" else 0
-            except: pass
-
-    # Если xG нет, но есть удары (матч идет) — считаем сами!
-    if xg_h == 0 and xg_a == 0 and (shots_h > 0 or shots_a > 0):
-        xg_h = (sot_h * 0.25) + ((shots_h - sot_h) * 0.05)
-        xg_a = (sot_a * 0.25) + ((shots_a - sot_a) * 0.05)
-
-    # Если это будущий матч (NS), идем в BSD за прогнозами
-    if fx["status"] == "NS" and xg_h == 0:
+        stats = s.get("stats", [0, 0])
+        if not isinstance(stats, list) or len(stats) < 2: continue
+        
         try:
-            async with httpx.AsyncClient() as client:
-                search_q = f"{fx['home']} {fx['away']}"
-                res = await client.get(f"https://sports.bzzoiro.com/api/v2/events/?search={search_q}", headers={"Authorization": f"Token {BSD_TOKEN}"}, timeout=10)
-                if res.status_code == 200 and res.json().get("results"):
-                    bsd_id = res.json()["results"][0]["id"]
-                    pred_res = await client.get(f"https://sports.bzzoiro.com/api/v2/events/{bsd_id}/prediction/", headers={"Authorization": f"Token {BSD_TOKEN}"})
-                    if pred_res.status_code == 200:
-                        pred = pred_res.json()
-                        xg_h = float(pred.get("expected_goals", {}).get("home", 0.0))
-                        xg_a = float(pred.get("expected_goals", {}).get("away", 0.0))
-        except Exception as e:
-            logger.warning(f"BSD xG error: {e}")
+            if name == "Expected goals (xG)":
+                if stats[0] != "-": xg_h = float(stats[0])
+                if stats[1] != "-": xg_a = float(stats[1])
+            if name == "Total shots":
+                if stats[0] != "-": shots_h = int(stats[0])
+                if stats[1] != "-": shots_a = int(stats[1])
+            if name == "Shots on target":
+                if stats[0] != "-": sot_h = int(stats[0])
+                if stats[1] != "-": sot_a = int(stats[1])
+        except: pass
 
-    # Если данных вообще нет, ставим средние
-    if xg_h == 0 and xg_a == 0:
-        xg_h, xg_a = 1.35, 1.15
+    if xg_h == 0 and xg_a == 0 and (shots_h > 0 or shots_a > 0):
+        xg_h = (sot_h * 0.3) + ((shots_h - sot_h) * 0.05)
+        xg_a = (sot_a * 0.3) + ((shots_a - sot_a) * 0.05)
+
+    if xg_h == 0 or xg_a == 0:
+        h_avg, h_conc = await get_team_avg_goals(fx.get("homeId"))
+        a_avg, a_conc = await get_team_avg_goals(fx.get("awayId"))
+        if xg_h == 0: xg_h = (h_avg + a_conc) / 2
+        if xg_a == 0: xg_a = (a_avg + h_conc) / 2
+
+    if xg_h <= 0: xg_h = 1.2
+    if xg_a <= 0: xg_a = 1.2
 
     # 2. Математика
     gh, ga = fx["homeScore"], fx["awayScore"]
     time_left = 1.0 if fx["status"] == "NS" else 0.0
+    minute = 0
     if fx["status"] == "LIVE":
         min_str = str(fx["minute"]).replace("'", "").replace("HT", "45")
         minute = int(min_str) if min_str.isdigit() else 45
@@ -190,45 +206,151 @@ async def run_oracle(event_id: str):
     if gh > ga: lambda_a *= 1.2
     if ga > gh: lambda_h *= 1.2
 
-    probs = {"p1": 0, "px": 0, "p2": 0, "over25": 0, "btts": 0}
-    for h in range(6):
-        for a in range(6):
+    # Инициализация словаря рынков
+    markets = {"1": 0, "X": 0, "2": 0, "BTTS_Yes": 0, "BTTS_No": 0}
+    
+    total_lines = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
+    for t in total_lines:
+        markets[f"O{t}"] = 0; markets[f"U{t}"] = 0
+        markets[f"IT1_O{t}"] = 0; markets[f"IT1_U{t}"] = 0
+        markets[f"IT2_O{t}"] = 0; markets[f"IT2_U{t}"] = 0
+
+    handicap_lines = [-4.5, -4, -3.5, -3, -2.5, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5]
+    for h_val in handicap_lines:
+        markets[f"AH1_{h_val}"] = 0
+        markets[f"AH2_{h_val}"] = 0
+
+    # Рынки 1-го тайма (только если не 2-й тайм)
+    is_ht_active = fx["status"] == "NS" or (fx["status"] == "LIVE" and minute <= 45)
+    if is_ht_active:
+        for t in [0.5, 1.5, 2.5, 3.5, 4.5]:
+            markets[f"HT_O{t}"] = 0; markets[f"HT_U{t}"] = 0
+            markets[f"HT_IT1_O{t}"] = 0; markets[f"HT_IT2_O{t}"] = 0
+
+    # Основной цикл симуляции (до 9 голов)
+    for h in range(10):
+        for a in range(10):
             p_h = (math.exp(-lambda_h) * (lambda_h**h)) / math.factorial(h)
             p_a = (math.exp(-lambda_a) * (lambda_a**a)) / math.factorial(a)
             p = p_h * p_a
-            
             fh, fa = gh + h, ga + a
-            if fh > fa: probs["p1"] += p
-            elif fh < fa: probs["p2"] += p
-            else: probs["px"] += p
-            if fh + fa > 2.5: probs["over25"] += p
-            if fh > 0 and fa > 0: probs["btts"] += p
+            
+            # 1X2
+            if fh > fa: markets["1"] += p
+            elif fh < fa: markets["2"] += p
+            else: markets["X"] += p
 
-    total_p = probs["p1"] + probs["px"] + probs["p2"]
-    for k in probs: probs[k] /= total_p
+            # BTTS
+            if fh > 0 and fa > 0: markets["BTTS_Yes"] += p
+            else: markets["BTTS_No"] += p
 
-    # 3. Промпт
+            # Totals & Individual Totals
+            tg = fh + fa
+            for t in total_lines:
+                if tg > t: markets[f"O{t}"] += p
+                else: markets[f"U{t}"] += p
+                if fh > t: markets[f"IT1_O{t}"] += p
+                else: markets[f"IT1_U{t}"] += p
+                if fa > t: markets[f"IT2_O{t}"] += p
+                else: markets[f"IT2_U{t}"] += p
+
+            # Asian Handicaps
+            for h_val in handicap_lines:
+                if fh + h_val > fa: markets[f"AH1_{h_val}"] += p
+                if fa + h_val > fh: markets[f"AH2_{h_val}"] += p
+
+    # Симуляция для 1-го тайма
+    if is_ht_active:
+        ht_time_left = 1.0 if fx["status"] == "NS" else max(0, (45 - minute) / 90)
+        lambda_h_ht = xg_h * ht_time_left
+        lambda_a_ht = xg_a * ht_time_left
+        
+        for h in range(8):
+            for a in range(8):
+                p_h = (math.exp(-lambda_h_ht) * (lambda_h_ht**h)) / math.factorial(h)
+                p_a = (math.exp(-lambda_a_ht) * (lambda_a_ht**a)) / math.factorial(a)
+                p = p_h * p_a
+                fh, fa = gh + h, ga + a # Если матч уже идет, gh/ga - это голы в 1-м тайме
+
+                tg = fh + fa
+                for t in [0.5, 1.5, 2.5, 3.5, 4.5]:
+                    if tg > t: markets[f"HT_O{t}"] += p
+                    else: markets[f"HT_U{t}"] += p
+                    if fh > t: markets[f"HT_IT1_O{t}"] += p
+                    if fa > t: markets[f"HT_IT2_O{t}"] += p
+
+    # Нормализация (сумма вероятностей 1X2 должна быть 1)
+    total_p = markets["1"] + markets["X"] + markets["2"]
+    for k in markets: markets[k] /= total_p
+
+    # 3. ФИЛЬТРАЦИЯ ДОСТУПНЫХ РЫНКОВ
+    available = []
+    
+    if fx["status"] != "FT":
+        available.extend([
+            {"name": f"П1 ({fx['home']})", "prob": markets["1"]},
+            {"name": "Ничья (X)", "prob": markets["X"]},
+            {"name": f"П2 ({fx['away']})", "prob": markets["2"]},
+        ])
+    
+    # Тоталы и Индивидуальные тоталы
+    for t in total_lines:
+        if 0.03 < markets[f"O{t}"] < 0.97:
+            available.append({"name": f"ТБ {t}", "prob": markets[f"O{t}"]})
+            available.append({"name": f"ТМ {t}", "prob": markets[f"U{t}"]})
+        if 0.03 < markets[f"IT1_O{t}"] < 0.97:
+            available.append({"name": f"ИТ1 Б {t}", "prob": markets[f"IT1_O{t}"]})
+            available.append({"name": f"ИТ1 М {t}", "prob": markets[f"IT1_U{t}"]})
+        if 0.03 < markets[f"IT2_O{t}"] < 0.97:
+            available.append({"name": f"ИТ2 Б {t}", "prob": markets[f"IT2_O{t}"]})
+            available.append({"name": f"ИТ2 М {t}", "prob": markets[f"IT2_U{t}"]})
+
+    # Форы
+    for h_val in handicap_lines:
+        if 0.03 < markets[f"AH1_{h_val}"] < 0.97:
+            available.append({"name": f"Ф1 ({h_val})", "prob": markets[f"AH1_{h_val}"]})
+        if 0.03 < markets[f"AH2_{h_val}"] < 0.97:
+            available.append({"name": f"Ф2 ({h_val})", "prob": markets[f"AH2_{h_val}"]})
+
+    # ОЗ
+    if 0.03 < markets["BTTS_Yes"] < 0.97:
+        available.append({"name": "ОЗ (Да)", "prob": markets["BTTS_Yes"]})
+        available.append({"name": "ОЗ (Нет)", "prob": markets["BTTS_No"]})
+
+    # 1-й тайм
+    if is_ht_active:
+        for t in [0.5, 1.5, 2.5, 3.5, 4.5]:
+            if 0.03 < markets[f"HT_O{t}"] < 0.97:
+                available.append({"name": f"ТБ {t} в 1-м тайме", "prob": markets[f"HT_O{t}"]})
+                available.append({"name": f"ТМ {t} в 1-м тайме", "prob": markets[f"HT_U{t}"]})
+            if 0.03 < markets[f"HT_IT1_O{t}"] < 0.97:
+                available.append({"name": f"ИТ1 Б {t} в 1-м тайме", "prob": markets[f"HT_IT1_O{t}"]})
+            if 0.03 < markets[f"HT_IT2_O{t}"] < 0.97:
+                available.append({"name": f"ИТ2 Б {t} в 1-м тайме", "prob": markets[f"HT_IT2_O{t}"]})
+
+    # Сортировка и выбор топ-6 для ИИ
+    available.sort(key=lambda x: x["prob"], reverse=True)
+    top_markets = available[:6]
+    top_markets_str = "\n".join([f"- {m['name']} ({(m['prob']*100):.1f}%)" for m in top_markets])
+
+    # 4. Промпт
     prompt = f"""
     Ты профессиональный футбольный аналитик.
-    Матч: {fx['home']} против {fx['away']}. Счет: {gh}:{ga} ({fx['status']}). 
-    Рассчитанные ожидаемые голы (xG): {xg_h:.2f} vs {xg_a:.2f}.
-    Вероятности: П1:{probs['p1']*100:.0f}%, X:{probs['px']*100:.0f}%, П2:{probs['p2']*100:.0f}%. ТБ2.5:{probs['over25']*100:.0f}%.
+    Матч: {fx['home']} против {fx['away']}. Счет: {gh}:{ga} ({fx['status']}).
+    Ожидаемые голы (xG): {xg_h:.2f} vs {xg_a:.2f}.
+    
+    Доступные рынки (отсортированы по вероятности):
+    {top_markets_str}
+    
     Травмы: {json.dumps(match_data['missing'])}. H2H: {json.dumps(match_data['h2h'])}.
 
-    Напиши разбор. Верни текст СТРОГО в таком формате (без лишних символов):
-    [PICK] Твой главный прогноз (например, П1 или ТБ 2.5)
-    [ANALYSIS] Подробный анализ на 3 абзаца. Почему этот исход? Упомяни xG.
+    ВАЖНО: В тексте используй ОБЩЕПРИНЯТЫЕ русскоязычные названия клубов.
+    Выбери ЛУЧШИЙ исход из списка доступных рынков. Напиши разбор. Верни текст СТРОГО в таком формате:
+    [PICK] Твой главный прогноз (точное название из списка, например: Ф1 (-1.5) или ТБ 1.5 в 1-м тайме)
+    [ANALYSIS] Подробный анализ на 3 абзаца. Почему этот исход? Упомяни xG, математику и контекст.
     [RISK] Главный риск этой ставки.
-    [ALT] Альтернативный исход.
+    [ALT] Альтернативный исход из списка.
     """
-
-    fallback_data = {
-        "main_pick": f"П1 ({fx['home']})" if probs['p1'] > probs['p2'] else f"П2 ({fx['away']})",
-        "confidence": "Средняя",
-        "analysis_text": f"Нейросеть недоступна. Математика: П1 - {(probs['p1']*100):.0f}%, X - {(probs['px']*100):.0f}%, П2 - {(probs['p2']*100):.0f}%. Ожидаемые голы: {xg_h:.2f} - {xg_a:.2f}.",
-        "risk_text": "Возможны ошибки из-за отсутствия глубокого ИИ-анализа.",
-        "alt_text": "Рекомендуется дождаться восстановления ИИ."
-    }
 
     try:
         async with httpx.AsyncClient() as client:
@@ -245,31 +367,19 @@ async def run_oracle(event_id: str):
             )
         
         if ai_res.status_code != 200:
-            err_msg = ai_res.text
-            logger.error(f"Groq API Error: {err_msg}")
-            # ВЫВОДИМ ОШИБКУ НА ЭКРАН ДЛЯ ОТЛАДКИ
-            fallback_data["analysis_text"] = f"ОШИБКА GROQ API: {err_msg[:120]}..."
-            return fallback_data
+            return {"main_pick": "Ошибка ИИ", "confidence": "Низкая", "analysis_text": ai_res.text, "risk_text": "-", "alt_text": "-"}
 
         ai_text = ai_res.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         
-        # Защита от кривого парсинга
-        pick = ai_text.split("[PICK]")[1].split("[ANALYSIS]")[0].strip() if "[PICK]" in ai_text else fallback_data["main_pick"]
+        pick = ai_text.split("[PICK]")[1].split("[ANALYSIS]")[0].strip() if "[PICK]" in ai_text else top_markets[0]["name"]
         analysis = ai_text.split("[ANALYSIS]")[1].split("[RISK]")[0].strip() if "[ANALYSIS]" in ai_text else ai_text
         risk = ai_text.split("[RISK]")[1].split("[ALT]")[0].strip() if "[RISK]" in ai_text else "-"
         alt = ai_text.split("[ALT]")[1].strip() if "[ALT]" in ai_text else "-"
         
-        return {
-            "main_pick": pick,
-            "confidence": "Высокая",
-            "analysis_text": analysis,
-            "risk_text": risk,
-            "alt_text": alt
-        }
+        return {"main_pick": pick, "confidence": "Высокая", "analysis_text": analysis, "risk_text": risk, "alt_text": alt}
+        
     except Exception as e:
-        logger.error(f"Oracle AI error: {e}")
-        fallback_data["analysis_text"] = f"ОШИБКА ПИТОНА: {str(e)[:120]}..."
-        return fallback_data
+        return {"main_pick": "Ошибка", "confidence": "Низкая", "analysis_text": str(e), "risk_text": "-", "alt_text": "-"}
 
 @app.get("/")
 async def health():
