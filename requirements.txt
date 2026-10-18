@@ -1,4 +1,3 @@
 fastapi
 uvicorn[standard]
-curl_cffi
-playwright
+httpx
