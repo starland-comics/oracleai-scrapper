@@ -8,7 +8,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oracle-scraper")
 
-app = FastAPI(title="Oracle AI Scraper (FotMob Debug)", version="3.1")
+app = FastAPI(title="Oracle AI Scraper (FotMob)", version="3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,45 +45,50 @@ async def fetch_fotmob(path: str) -> Dict:
         return cached
 
     url = f"https://www.fotmob.com/api{path}"
-    logger.info(f"Запрос к FotMob: {url}") # Логируем URL
+    logger.info(f"Запрос к FotMob: {url}")
 
-    async with httpx.AsyncClient(http2=True) as client: # Включаем HTTP/2
+    # Убрали http2=True, чтобы избежать ошибок зависимостей
+    async with httpx.AsyncClient() as client: 
         try:
             resp = await client.get(url, headers=HEADERS, timeout=15.0)
-            logger.info(f"Ответ FotMob: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
                 cache_set(cache_key, data)
                 return data
             else:
-                logger.error(f"FotMob HTTP {resp.status_code} for {url}. Ответ: {resp.text[:200]}")
-                raise HTTPException(status_code=resp.status_code, detail=f"FotMob error: {resp.status_code}")
+                logger.error(f"FotMob HTTP {resp.status_code} for {url}")
+                raise HTTPException(status_code=resp.status_code, detail=f"FotMob API вернул {resp.status_code}")
         except Exception as e:
             logger.error(f"Fetch error для {url}: {e}")
             raise HTTPException(status_code=502, detail=str(e))
 
 @app.get("/api/debug/fotmob-test")
 async def debug_fotmob():
-    """Тестовый эндпоинт для проверки доступа к FotMob."""
+    """Тестовый эндпоинт, который покажет ошибку, если она есть."""
     today_str = datetime.now().strftime("%Y%m%d")
     url = f"https://www.fotmob.com/api/matches?date={today_str}"
     
-    async with httpx.AsyncClient(http2=True) as client:
-        resp = await client.get(url, headers=HEADERS, timeout=15.0)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, headers=HEADERS, timeout=15.0)
+            return {
+                "status": "success",
+                "url": url,
+                "status_code": resp.status_code,
+                "body_start": resp.text[:300] # Показываем кусок ответа
+            }
+    except Exception as e:
         return {
+            "status": "error",
             "url": url,
-            "status_code": resp.status_code,
-            "headers": dict(resp.headers),
-            "body_start": resp.text[:500] # Первые 500 символов ответа
+            "error_type": type(e).__name__,
+            "message": str(e)
         }
 
 @app.get("/api/matches/live")
 async def get_live_matches():
     today_str = datetime.now().strftime("%Y%m%d")
-    try:
-        data = await fetch_fotmob(f"/matches?date={today_str}")
-    except HTTPException as e:
-        raise e
+    data = await fetch_fotmob(f"/matches?date={today_str}")
     
     leagues = data.get("leagues", [])
     result = []
@@ -137,7 +142,7 @@ async def get_match_detail(event_id: str):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "oracle-scraper-fotmob-debug"}
+    return {"status": "ok", "service": "oracle-scraper-fotmob-v3.2"}
 
 if __name__ == "__main__":
     import uvicorn
